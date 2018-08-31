@@ -129,7 +129,9 @@ pthread_scheduler_uninit ()
   for (i = 0; i < scheduler.num_threads; ++i)
     {
       pthread_join (scheduler.thread_pool[i].thread, NULL);
+      PTHREAD_DESTROY_LOCK (&scheduler.thread_pool[i].lock);
     }
+  scheduler.thread_pool_shutdown_requested = 0;
 
   pocl_aligned_free (scheduler.thread_pool);
   POCL_FAST_DESTROY (scheduler.wq_lock_fast);
