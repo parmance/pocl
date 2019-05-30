@@ -449,7 +449,7 @@ pocl_hsa_build_hash (cl_device_id device)
 // Detect the HSA device and populate its properties to the device
 // struct.
 static void
-get_hsa_device_features(char* dev_name, struct _cl_device_id* dev)
+get_hsa_device_features (char* dev_name, struct _cl_device_id* dev)
 {
 
 #define COPY_ATTR(ATTR) dev->ATTR = supported_hsa_devices[i].ATTR
@@ -688,7 +688,11 @@ pocl_hsa_init (unsigned j, cl_device_id dev, const char *parameters)
   HSA_CHECK(hsa_agent_get_info (agent, HSA_AGENT_INFO_NAME, dev->long_name));
   get_hsa_device_features (dev->long_name, dev);
 
-  dev->type = CL_DEVICE_TYPE_GPU;
+  hsa_device_type_t dev_type;
+  HSA_CHECK(hsa_agent_get_info (agent, HSA_AGENT_INFO_DEVICE,
+				&dev_type));
+  dev->type = dev_type == HSA_DEVICE_TYPE_GPU ?
+    CL_DEVICE_TYPE_GPU : CL_DEVICE_TYPE_CPU;
 
   // Enable when it's actually implemented AND if supported by
   // the target agent (check with hsa_agent_extension_supported).
