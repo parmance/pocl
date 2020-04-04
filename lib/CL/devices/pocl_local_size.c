@@ -237,10 +237,12 @@ pocl_default_local_size_optimizer (cl_device_id dev, size_t global_x,
   const size_t min_group_size
       = min (4 * preferred_wg_multiple, max_group_size);
 
-  /* We need the number of Compute Units in the device, since we want
-   * at least that many work-groups, if possible */
+  /* We want enough WGs to fill up the compute units in the device and
+   * some extra to allow for load balancing due to uneven WG execution
+   * times because of cache effects, background noise and other delays.
+   */
 
-  cl_uint ncus = dev->max_compute_units;
+  cl_uint ncus = 2 * dev->max_compute_units;
 
   /* number of workgroups */
   size_t nwg_x = global_x / *local_x;

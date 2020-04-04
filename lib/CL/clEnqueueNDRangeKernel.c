@@ -201,13 +201,12 @@ POname(clEnqueueNDRangeKernel)(cl_command_queue command_queue,
                                            &local_z);
     }
 
-  POCL_MSG_PRINT_INFO("Queueing kernel %s with local size %u x %u x %u group "
-                      "sizes %u x %u x %u...\n",
-                      kernel->name,
-                      (unsigned)local_x, (unsigned)local_y, (unsigned)local_z,
-                      (unsigned)(global_x / local_x),
-                      (unsigned)(global_y / local_y),
-                      (unsigned)(global_z / local_z));
+  POCL_MSG_PRINT_INFO (
+      "Queueing kernel %s with local size %u x %u x %u (%u) group "
+      "sizes %u x %u x %u... \n",
+      kernel->name, (unsigned)local_x, (unsigned)local_y, (unsigned)local_z,
+      (unsigned)(local_x * local_y * local_z), (unsigned)(global_x / local_x),
+      (unsigned)(global_y / local_y), (unsigned)(global_z / local_z));
 
   assert (local_x * local_y * local_z <= max_group_size);
   assert (local_x <= max_local_x);

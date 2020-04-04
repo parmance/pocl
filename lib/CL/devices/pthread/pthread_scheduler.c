@@ -1,6 +1,6 @@
 /* OpenCL native pthreaded device implementation.
 
-   Copyright (c) 2011-2019 pocl developers
+   Copyright (c) 2011-2020 pocl developers
 
    Permission is hereby granted, free of charge, to any person obtaining a copy
    of this software and associated documentation files (the "Software"), to
@@ -21,25 +21,30 @@
    IN THE SOFTWARE.
 */
 
+/* #define DEBUG_MT */
+/* Enable for thread work imbalance statistics printouts. */
+/* #define IMBALANCE_STATS */
 #define _GNU_SOURCE
 
 #ifdef __linux__
 #include <sched.h>
 #endif
 
+#include <math.h>
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
-#include "pocl-pthread_scheduler.h"
-#include "pocl_cl.h"
-#include "pocl-pthread.h"
-#include "pocl-pthread_utils.h"
-#include "utlist.h"
-#include "pocl_util.h"
 #include "common.h"
+#include "pocl-pthread.h"
+#include "pocl-pthread_scheduler.h"
+#include "pocl-pthread_utils.h"
+#include "pocl_cl.h"
 #include "pocl_mem_management.h"
+#include "pocl_timing.h"
+#include "pocl_util.h"
+#include "utlist.h"
 
 static void* pocl_pthread_driver_thread (void *p);
 
@@ -57,6 +62,9 @@ struct pool_thread_data
    * used for deciding whether a particular thread should run
    * commands scheduled on a subdevice. */
   unsigned index;
+  unsigned wgs_executed;
+  uint64_t wgs_time;
+  ;
   /* printf buffer*/
   void *printf_buffer;
 } __attribute__ ((aligned (HOST_CPU_CACHELINE_SIZE)));
@@ -73,7 +81,6 @@ typedef struct scheduler_data_
       __attribute__ ((aligned (HOST_CPU_CACHELINE_SIZE)));
   kernel_run_command *kernel_queue;
 
-  pthread_cond_t wake_pool __attribute__ ((aligned (HOST_CPU_CACHELINE_SIZE)));
   POCL_FAST_LOCK_T wq_lock_fast __attribute__ ((aligned (HOST_CPU_CACHELINE_SIZE)));
 
   int thread_pool_shutdown_requested;
@@ -87,8 +94,6 @@ pthread_scheduler_init (cl_device_id device)
   unsigned i;
   size_t num_worker_threads = device->max_compute_units;
   POCL_FAST_INIT (scheduler.wq_lock_fast);
-
-  pthread_cond_init (&(scheduler.wake_pool), NULL);
 
   scheduler.thread_pool = pocl_aligned_malloc (
       HOST_CPU_CACHELINE_SIZE,
@@ -123,7 +128,6 @@ pthread_scheduler_uninit ()
 
   POCL_FAST_LOCK (scheduler.wq_lock_fast);
   scheduler.thread_pool_shutdown_requested = 1;
-  pthread_cond_broadcast (&scheduler.wake_pool);
   POCL_FAST_UNLOCK (scheduler.wq_lock_fast);
 
   for (i = 0; i < scheduler.num_threads; ++i)
@@ -133,8 +137,6 @@ pthread_scheduler_uninit ()
 
   pocl_aligned_free (scheduler.thread_pool);
   POCL_FAST_DESTROY (scheduler.wq_lock_fast);
-  pthread_cond_destroy (&scheduler.wake_pool);
-
   scheduler.thread_pool_shutdown_requested = 0;
 }
 
@@ -144,7 +146,6 @@ void pthread_scheduler_push_command (_cl_command_node *cmd)
 {
   POCL_FAST_LOCK (scheduler.wq_lock_fast);
   DL_APPEND (scheduler.work_queue, cmd);
-  pthread_cond_broadcast (&scheduler.wake_pool);
   POCL_FAST_UNLOCK (scheduler.wq_lock_fast);
 }
 
@@ -153,7 +154,6 @@ pthread_scheduler_push_kernel (kernel_run_command *run_cmd)
 {
   POCL_FAST_LOCK (scheduler.wq_lock_fast);
   DL_APPEND (scheduler.kernel_queue, run_cmd);
-  pthread_cond_broadcast (&scheduler.wake_pool);
   POCL_FAST_UNLOCK (scheduler.wq_lock_fast);
 }
 
@@ -176,54 +176,41 @@ shall_we_run_this (thread_data *td, cl_device_id subd)
   return 1;
 }
 
-/* Maximum and minimum chunk sizes for get_wg_index_range().
- * Each pthread driver's thread fetches work from a kernel's WG pool in
- * chunks, this determines the limits (scaled up by # of threads). */
-#define POCL_PTHREAD_MAX_WGS 256
-#define POCL_PTHREAD_MIN_WGS 32
-
+/* Gets a range of (flat) work-group indices for a thread to execute.
+   start_index and end_index are set to the first and last index to execute,
+   respectively. last_wgs is set to 1 in case the last work-group indices
+   were given to the thread. num_threads is the count of threads participating
+   in the work sharing. */
 static int
 get_wg_index_range (kernel_run_command *k, unsigned *start_index,
                     unsigned *end_index, int *last_wgs, unsigned num_threads)
 {
-  const unsigned scaled_max_wgs = POCL_PTHREAD_MAX_WGS * num_threads;
-  const unsigned scaled_min_wgs = POCL_PTHREAD_MIN_WGS * num_threads;
+  const int64_t remaining_wgs = k->num_groups - k->wgs_dealt;
+  if (remaining_wgs < 1)
+    return 0;
+  const uint32_t chunk_split_pow = floor (log2 (remaining_wgs));
+  const uint32_t chunk_start = pow (2, chunk_split_pow - 1);
+  const uint32_t chunk_end = pow (2, chunk_split_pow);
+  const uint32_t chunk_size = chunk_end - chunk_start;
+  uint32_t thread_share = max (1, chunk_size / num_threads);
+  *end_index = POCL_ATOMIC_ADD (k->wgs_dealt, thread_share) - 1;
+  *start_index = *end_index + 1 - thread_share;
 
-  unsigned limit;
-  unsigned max_wgs;
-  POCL_FAST_LOCK (k->lock);
-  if (k->remaining_wgs == 0)
+  if (*end_index >= k->num_groups - 1)
     {
-      POCL_FAST_UNLOCK (k->lock);
-      return 0;
+      *last_wgs = 1;
+      *end_index = k->num_groups - 1;
     }
 
-  /* If the work is comprised of huge number of WGs of small WIs,
-   * then get_wg_index_range() becomes a problem on manycore CPUs
-   * because lock contention on k->lock.
-   *
-   * If we have enough workgroups, scale up the requests linearly by
-   * num_threads, otherwise fallback to smaller workgroups.
-   */
-  if (k->remaining_wgs <= (scaled_max_wgs * num_threads))
-    limit = scaled_min_wgs;
-  else
-    limit = scaled_max_wgs;
+  if (*start_index >= k->num_groups)
+    return 0;
 
-  // divide two integers rounding up, i.e. ceil(k->remaining_wgs/num_threads)
-  const unsigned wgs_per_thread = (1 + (k->remaining_wgs - 1) / num_threads);
-  max_wgs = min (limit, wgs_per_thread);
-  max_wgs = min (max_wgs, k->remaining_wgs);
-  assert (max_wgs > 0);
-
-  *start_index = k->wgs_dealt;
-  *end_index = k->wgs_dealt + max_wgs-1;
-  k->remaining_wgs -= max_wgs;
-  k->wgs_dealt += max_wgs;
-  if (k->remaining_wgs == 0)
-    *last_wgs = 1;
-  POCL_FAST_UNLOCK (k->lock);
-
+#ifdef DEBUG_MT
+  printf ("### remaining wgs %lu chunk start %u chunk end %u thread share %u "
+          "si %u ei %i\n",
+          remaining_wgs, chunk_start, chunk_end, thread_share, *start_index,
+          *end_index);
+#endif
   return 1;
 }
 
@@ -244,6 +231,8 @@ work_group_scheduler (kernel_run_command *k,
 {
   pocl_kernel_metadata_t *meta = k->kernel->meta;
 
+  thread_data->wgs_executed = 0;
+  uint64_t start_time = pocl_gettimemono_ns ();
   void *arguments[meta->num_args + meta->num_locals + 1];
   void *arguments2[meta->num_args + meta->num_locals + 1];
   struct pocl_context pc;
@@ -254,7 +243,14 @@ work_group_scheduler (kernel_run_command *k,
 
   if (!get_wg_index_range (k, &start_index, &end_index, &last_wgs,
                            thread_data->num_threads))
-    return 0;
+    {
+#ifdef DEBUG_MT_
+      thread_data->wgs_time = 0;
+      printf ("### exec_wg (thread %d): NO wgs executed\n",
+              thread_data->index);
+#endif
+      return 0;
+    }
 
   assert (end_index >= start_index);
 
@@ -293,20 +289,31 @@ work_group_scheduler (kernel_run_command *k,
           POCL_FAST_UNLOCK (scheduler.wq_lock_fast);
         }
 
+#ifdef DEBUG_MT_
+      printf (
+          "### exec_wg (thread %d): executing WG range %u to %u (%u wgs)\n",
+          thread_data->index, start_index, end_index,
+          end_index - start_index + 1);
+#endif
       for (i = start_index; i <= end_index; ++i)
         {
-	  size_t gids[3];
+          size_t gids[3];
           translate_wg_index_to_3d_index (k, i, gids,
                                           slice_size, row_size);
 
-#ifdef DEBUG_MT
-          printf("### exec_wg: gid_x %zu, gid_y %zu, gid_z %zu\n",
-                 gids[0], gids[1], gids[2]);
+#ifdef DEBUG_MT_
+          printf ("### exec_wg (thread %d): gid_x %zu, gid_y %zu, gid_z %zu\n",
+                  thread_data->index, gids[0], gids[1], gids[2]);
 #endif
           pocl_set_default_rm ();
-          k->workgroup ((uint8_t*)arguments, (uint8_t*)&pc,
-			gids[0], gids[1], gids[2]);
+          k->workgroup ((uint8_t *)arguments, (uint8_t *)&pc, gids[0], gids[1],
+                        gids[2]);
+          thread_data->wgs_executed++;
         }
+#ifdef DEBUG_MT_
+      printf ("### exec_wg (thread %d): finished WG range %u to %u\n",
+              thread_data->index, start_index, end_index);
+#endif
     }
   while (get_wg_index_range (k, &start_index, &end_index, &last_wgs,
                              thread_data->num_threads));
@@ -315,10 +322,21 @@ work_group_scheduler (kernel_run_command *k,
     {
       write (STDOUT_FILENO, pc.printf_buffer, position);
     }
-
   free_kernel_arg_array_with_locals ((void **)&arguments, (void **)&arguments2,
                                      k);
+#ifdef IMBALANCE_STATS
+  thread_data->wgs_time = pocl_gettimemono_ns () - start_time;
+  unsigned total_wgs_left = k->num_groups;
+  for (int i = 0; i < scheduler.num_threads; ++i)
+    {
+      total_wgs_left -= scheduler.thread_pool[i].wgs_executed;
+    }
 
+  printf (
+      "### exec_wg (thread %d): %u wgs executed (in %zu ns) %lu wgs left\n",
+      thread_data->index, thread_data->wgs_executed, thread_data->wgs_time,
+      total_wgs_left);
+#endif
   return 1;
 }
 
@@ -326,8 +344,28 @@ static void
 finalize_kernel_command (struct pool_thread_data *thread_data,
                          kernel_run_command *k)
 {
-#ifdef DEBUG_MT
+#ifdef IMBALANCE_STATS
+  uint64_t total_thread_time = 0;
+  uint64_t max_thread_time = 0;
+  unsigned total_wgs = 0;
+  for (int i = 0; i < scheduler.num_threads; ++i)
+    {
+      total_thread_time += scheduler.thread_pool[i].wgs_time;
+      max_thread_time
+          = max (max_thread_time, scheduler.thread_pool[i].wgs_time);
+      total_wgs += scheduler.thread_pool[i].wgs_executed;
+      scheduler.thread_pool[i].wgs_time = 0;
+      scheduler.thread_pool[i].wgs_executed = 0;
+    }
+
+  uint64_t perfect_balance
+      = total_thread_time / min (scheduler.num_threads, total_wgs);
+  uint64_t max_imbalance_penalty = max_thread_time - perfect_balance;
   printf("### kernel %s finished\n", k->cmd->command.run.kernel->name);
+  printf (
+      "### max thread time %zu ns, max imbalance penalty %zu ns (%u%%)\n\n",
+      max_thread_time, max_imbalance_penalty,
+      (unsigned)(100 * max_imbalance_penalty / max_thread_time));
 #endif
 
   free_kernel_arg_array (k);
@@ -363,7 +401,7 @@ pocl_pthread_prepare_kernel (void *data, _cl_command_node *cmd)
   run_cmd->pc.printf_buffer = NULL;
   run_cmd->pc.printf_buffer_capacity = scheduler.printf_buf_size;
   run_cmd->pc.printf_buffer_position = NULL;
-  run_cmd->remaining_wgs = num_groups;
+  run_cmd->num_groups = num_groups;
   run_cmd->wgs_dealt = 0;
   run_cmd->workgroup = cmd->command.run.wg;
   run_cmd->kernel_args = cmd->command.run.arguments;
@@ -438,10 +476,11 @@ pthread_scheduler_get_work (thread_data *td)
   kernel_run_command *run_cmd;
 
   /* execute kernel if available */
-  POCL_FAST_LOCK (scheduler.wq_lock_fast);
   int do_exit = 0;
 
 RETRY:
+  POCL_FAST_LOCK (scheduler.wq_lock_fast);
+
   do_exit = scheduler.thread_pool_shutdown_requested;
 
   run_cmd = check_kernel_queue_for_device (td);
@@ -486,7 +525,7 @@ RETRY:
   /* if neither a command nor a kernel was available, sleep */
   if ((cmd == NULL) && (run_cmd == NULL) && (do_exit == 0))
     {
-      pthread_cond_wait (&scheduler.wake_pool, &scheduler.wq_lock_fast);
+      POCL_FAST_UNLOCK (scheduler.wq_lock_fast);
       goto RETRY;
     }
 

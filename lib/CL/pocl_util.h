@@ -49,7 +49,8 @@ extern "C" {
 
 /* These return the new value. */
 /* See: https://gcc.gnu.org/onlinedocs/gcc-4.1.2/gcc/Atomic-Builtins.html */
-#define POCL_ATOMIC_INC(x) __sync_add_and_fetch (&x, 1)
+#define POCL_ATOMIC_ADD(x, VALUE) __sync_add_and_fetch (&x, VALUE)
+#define POCL_ATOMIC_INC(x) POCL_ATOMIC_ADD (x, 1)
 #define POCL_ATOMIC_DEC(x) __sync_sub_and_fetch (&x, 1)
 #define POCL_ATOMIC_CAS(ptr, oldval, newval)                                  \
   __sync_val_compare_and_swap (ptr, oldval, newval)

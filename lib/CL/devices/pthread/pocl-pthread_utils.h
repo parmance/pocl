@@ -55,8 +55,12 @@ struct kernel_run_command
 
   POCL_FAST_LOCK_T lock __attribute__ ((aligned (HOST_CPU_CACHELINE_SIZE)));
 
-  size_t remaining_wgs __attribute__ ((aligned (HOST_CPU_CACHELINE_SIZE)));
+  /* The flat index of the _next_ work-group index to distribute to a thread.
+   * This counter can get incremented above num_groups towards the end of the
+   * execution of a kernel. */
   size_t wgs_dealt;
+  /* Total number of work-groups to distribute. */
+  size_t num_groups;
 
   struct pocl_context pc __attribute__ ((aligned (HOST_CPU_CACHELINE_SIZE)));
 
